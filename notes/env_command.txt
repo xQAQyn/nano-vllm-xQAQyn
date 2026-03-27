@@ -1,0 +1,7 @@
+commands:
+
+uv init --python 3.12
+uv venv
+pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+uv pip install ../tmp/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+uv add tqdm transformers xxhash
