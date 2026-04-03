@@ -1,0 +1,5 @@
+- [Speculative Decoding Architecture](project_speculative_arch.md) — Simplified EAGLE-3 implementation: static flat-chain verification, multi-layer fusion, greedy acceptance
+- [Draft Model Weight Map](project_draft_weights.md) — SpecForge checkpoint naming conventions and the d2t/t2d vocab mapping
+- [Block Manager Speculative Protocol](project_block_speculative.md) — pre_allocate / deallocate_speculative transactional pattern for verification slots
+- [User Preferences](feedback_env.md) — Use uv for Python tooling, not global python
+- [Test Infrastructure](project_tests.md) — 46 tests, CPU-first with TORCHDYNAMO_DISABLE, dist init via gloo

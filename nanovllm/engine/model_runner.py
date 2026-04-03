@@ -9,7 +9,7 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
-from nanovllm.utils.loader import load_model
+from nanovllm.utils.loader import load_model, load_eagle3_model
 
 
 class ModelRunner:
@@ -31,6 +31,19 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+
+        self.use_speculative = config.draft_model is not None
+        self.draft_model = None
+        self.capture_layers = None
+        self.saved_hidden = {}
+        if self.use_speculative:
+            from nanovllm.models.eagle3 import Eagle3DraftModel
+            self.capture_layers = set(config.base_model_layers)
+            self.draft_model = Eagle3DraftModel(config.draft_hf_config, hf_config.hidden_size)
+            load_eagle3_model(self.draft_model, config.draft_model)
+            self.draft_model.allocate_kv_cache(config.num_speculative_tokens + 1)
+            self.num_speculative_tokens = config.num_speculative_tokens
+
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -212,6 +225,119 @@ class ModelRunner:
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
+
+    @torch.inference_mode()
+    def run_prefill_with_capture(self, seqs: list[Sequence]) -> list[int]:
+        input_ids, positions = self.prepare_prefill(seqs)
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        hidden_states, captured = self.model(input_ids, positions, capture_layers=self.capture_layers)
+        context = get_context()
+        last_indices = context.cu_seqlens_q[1:] - 1
+        logits = self.model.compute_logits(hidden_states)
+        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        if self.rank == 0:
+            for i, seq in enumerate(seqs):
+                idx = last_indices[i].item()
+                self.saved_hidden[seq.seq_id] = {l: captured[l][idx:idx+1] for l in captured}
+        reset_context()
+        return token_ids
+
+    def prepare_verify(self, seqs: list[Sequence], all_draft_tokens: list[list[int]]):
+        input_ids = []
+        positions = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+        slot_mapping = []
+        for seq, draft_tokens in zip(seqs, all_draft_tokens):
+            verify_tokens = [seq.last_token] + draft_tokens
+            n = len(verify_tokens)
+            start_pos = len(seq) - 1
+            input_ids.extend(verify_tokens)
+            positions.extend(list(range(start_pos, start_pos + n)))
+            seqlen_k = len(seq) - 1 + n
+            cu_seqlens_q.append(cu_seqlens_q[-1] + n)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+            max_seqlen_q = max(n, max_seqlen_q)
+            max_seqlen_k = max(seqlen_k, max_seqlen_k)
+            last_block_idx = len(seq.block_table) - 1
+            for i in range(n):
+                pos = start_pos + i
+                block_idx = pos // self.block_size
+                offset = pos % self.block_size
+                if block_idx < len(seq.block_table):
+                    slot = seq.block_table[block_idx] * self.block_size + offset
+                else:
+                    slot = -1
+                slot_mapping.append(slot)
+        block_tables = self.prepare_block_tables(seqs)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        return input_ids, positions
+
+    def accept_tokens(self, seq_logits, draft_tokens, seq_captured):
+        target_tokens = seq_logits.argmax(dim=-1)
+        accepted = []
+        for i, dt in enumerate(draft_tokens):
+            if target_tokens[i].item() == dt:
+                accepted.append(dt)
+            else:
+                new_token = target_tokens[i].item()
+                accept_pos = i
+                new_hidden = {l: seq_captured[l][accept_pos:accept_pos+1] for l in seq_captured}
+                return accepted, new_token, new_hidden
+        new_token = target_tokens[len(draft_tokens)].item()
+        accept_pos = len(draft_tokens)
+        new_hidden = {l: seq_captured[l][accept_pos:accept_pos+1] for l in seq_captured}
+        return accepted, new_token, new_hidden
+
+    @torch.inference_mode()
+    def run_speculative(self, seqs: list[Sequence], block_manager=None):
+        k = self.num_speculative_tokens
+
+        all_draft_tokens = []
+        for seq in seqs:
+            fused = self.draft_model.fuse_features(self.saved_hidden[seq.seq_id])
+            drafts = self.draft_model.generate(
+                self.model.model.embed_tokens,
+                fused,
+                start_token=torch.tensor([seq.last_token], device="cuda", dtype=torch.long),
+                start_pos=len(seq),
+                k=k,
+            )
+            all_draft_tokens.append(drafts)
+
+        # Pre-allocate blocks so slot_mapping can address speculative positions
+        if block_manager is not None:
+            for seq, drafts in zip(seqs, all_draft_tokens):
+                block_manager.pre_allocate_speculative(seq, len(drafts) + 1)
+
+        input_ids, positions = self.prepare_verify(seqs, all_draft_tokens)
+        hidden_states, captured = self.model(input_ids, positions, capture_layers=self.capture_layers)
+        logits = self.model.compute_logits_all(hidden_states)
+        reset_context()
+
+        results = []
+        offset = 0
+        for i, seq in enumerate(seqs):
+            n_tokens = len(all_draft_tokens[i]) + 1
+            seq_logits = logits[offset:offset + n_tokens]
+            seq_captured = {l: captured[l][offset:offset + n_tokens] for l in captured}
+            accepted, new_token, new_hidden = self.accept_tokens(
+                seq_logits, all_draft_tokens[i], seq_captured
+            )
+            results.append((accepted, new_token))
+            self.saved_hidden[seq.seq_id] = new_hidden
+            offset += n_tokens
+        return results
+
+    def clear_saved_hidden(self, seq_id: int):
+        self.saved_hidden.pop(seq_id, None)
 
     @torch.inference_mode()
     def capture_cudagraph(self):

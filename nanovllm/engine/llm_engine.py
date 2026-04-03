@@ -31,6 +31,7 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.use_speculative = config.draft_model is not None
         atexit.register(self.exit)
 
     def exit(self):
@@ -47,10 +48,29 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
+        if is_prefill:
+            if self.use_speculative:
+                token_ids = self.model_runner.call("run_prefill_with_capture", seqs)
+            else:
+                token_ids = self.model_runner.call("run", seqs, True)
+            self.scheduler.postprocess(seqs, token_ids)
+            outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+            num_tokens = sum(len(seq) for seq in seqs)
+            return outputs, num_tokens
+        if self.use_speculative:
+            block_manager = self.scheduler.block_manager
+            results = self.model_runner.call("run_speculative", seqs, block_manager)
+            self.scheduler.postprocess_speculative(seqs, results)
+            outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+            num_tokens = -sum(len(accepted) + 1 for accepted, _ in results)
+            for seq in seqs:
+                if seq.is_finished:
+                    self.model_runner.call("clear_saved_hidden", seq.seq_id)
+            return outputs, num_tokens
+        token_ids = self.model_runner.call("run", seqs, False)
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        num_tokens = -len(seqs)
         return outputs, num_tokens
 
     def is_finished(self):

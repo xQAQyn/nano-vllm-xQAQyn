@@ -110,3 +110,94 @@ class BlockManager:
             self.hash_to_block_id[h] = last_block.block_id
         else:
             assert last_block.hash == -1
+
+    def can_append_n(self, seq: Sequence, n: int) -> bool:
+        current_len = len(seq)
+        new_blocks = 0
+        for i in range(n):
+            pos = current_len + i + 1
+            if pos % self.block_size == 1:
+                new_blocks += 1
+        return len(self.free_block_ids) >= new_blocks
+
+    def may_append_n(self, seq: Sequence, n: int):
+        assert n < self.block_size
+        block_table = seq.block_table
+        last_block = self.blocks[block_table[-1]]
+        if (len(seq) + n) // self.block_size > len(block_table):
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            block_table.append(block_id)
+
+    def hash_completed_blocks(self, seq: Sequence):
+        """Hash any full blocks that haven't been hashed yet.
+
+        After a bulk token append (e.g. speculative decode), blocks that
+        became full may lack a hash.  This restores the invariant that
+        every full block has hash != -1 before the next may_append call.
+        """
+        block_table = seq.block_table
+        for i in range(len(block_table)):
+            block = self.blocks[block_table[i]]
+            if block.hash != -1:
+                continue
+            # Block is full if it's not the last block, or if len(seq)
+            # lands exactly on a block boundary.
+            is_full = (i < len(block_table) - 1) or (len(seq) % self.block_size == 0)
+            if is_full:
+                token_ids = seq.block(i)
+                prefix = self.blocks[block_table[i - 1]].hash if i > 0 else -1
+                h = self.compute_hash(token_ids, prefix)
+                block.update(h, token_ids)
+                self.hash_to_block_id[h] = block.block_id
+
+    def pre_allocate_speculative(self, seq: Sequence, n: int) -> int:
+        """Pre-allocate blocks so that n additional positions have valid slots.
+
+        Does not modify seq.num_tokens or seq.token_ids. Only extends
+        seq.block_table with new blocks as needed.
+
+        Returns the number of new blocks allocated.
+        """
+        new_blocks = 0
+        current_len = len(seq)
+        for i in range(n):
+            pos = current_len + i
+            block_idx = pos // self.block_size
+            if block_idx >= len(seq.block_table):
+                block_id = self.free_block_ids[0]
+                self._allocate_block(block_id)
+                seq.block_table.append(block_id)
+                new_blocks += 1
+        return new_blocks
+
+    def deallocate_speculative(self, seq: Sequence, num_accepted: int):
+        """Remove speculative blocks that exceed the accepted token range.
+
+        After acceptance, seq should have its tokens updated to include only
+        accepted tokens. This trims the block table back to match.
+        """
+        needed_blocks = seq.num_blocks
+        while len(seq.block_table) > needed_blocks:
+            block_id = seq.block_table.pop()
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+
+    def truncate(self, seq: Sequence, new_num_tokens: int):
+        old_num_blocks = seq.num_blocks
+        seq.num_tokens = new_num_tokens
+        seq.token_ids = seq.token_ids[:new_num_tokens]
+        seq.last_token = seq.token_ids[-1]
+        new_num_blocks = seq.num_blocks
+        for i in range(old_num_blocks - 1, new_num_blocks - 1, -1):
+            block_id = seq.block_table.pop()
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+        if seq.block_table:
+            last_block = self.blocks[seq.block_table[-1]]
+            last_block.hash = -1
+            last_block.token_ids = []
